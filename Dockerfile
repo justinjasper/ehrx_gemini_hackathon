@@ -76,6 +76,7 @@ COPY --from=builder /usr/local/bin /usr/local/bin
 # Copy application code
 COPY --chown=ehrx:ehrx ehrx/ ./ehrx/
 COPY --chown=ehrx:ehrx configs/ ./configs/
+COPY --chown=ehrx:ehrx SampleEHR_docs/ ./SampleEHR_docs/
 COPY --chown=ehrx:ehrx app.py run_mvp_pipeline.py test.py test_query_only.py ./
 COPY --chown=ehrx:ehrx setup.py ./
 
