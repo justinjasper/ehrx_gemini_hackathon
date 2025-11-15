@@ -17,6 +17,7 @@ from datetime import datetime
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse, FileResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 # Load environment variables
@@ -41,6 +42,26 @@ app = FastAPI(
     title="EHRX Pipeline API",
     description="EHR extraction pipeline using Google Gemini VLM",
     version="1.0.0"
+)
+
+# Configure CORS (allow override via env variable, fallback to known frontend)
+default_origins = [
+    "https://frontend-795204058658.europe-west1.run.app",
+    "http://localhost:5173",
+    "http://localhost:4173"
+]
+allowed_origins = os.getenv("CORS_ALLOW_ORIGINS")
+if allowed_origins:
+    origins_list = [origin.strip() for origin in allowed_origins.split(",") if origin.strip()]
+else:
+    origins_list = default_origins
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins_list,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Configuration
