@@ -60,7 +60,7 @@ temp/
 # Include immediate subdirectories (precomputed_samples/name/)
 !precomputed_samples/*/
 # Include canonical JSON at precomputed_samples/name/name.json
-!precomputed_samples/*/*.json
+!precomputed_samples/**/*.json
 
 # Sensitive files
 .env
