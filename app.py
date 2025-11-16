@@ -19,6 +19,7 @@ from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+import asyncio
 
 # Load environment variables
 from dotenv import load_dotenv
@@ -70,6 +71,15 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 SAMPLE_DOCS_DIR = Path(os.getenv("SAMPLE_DOCS_DIR", "./SampleEHR_docs")).resolve()
 SAMPLE_DOCS_DIR.mkdir(parents=True, exist_ok=True)
+
+# Precompute controls
+PRECOMPUTE_SAMPLES = os.getenv("PRECOMPUTE_SAMPLES", "true").lower() in {"1", "true", "yes", "y"}
+
+# In-memory caches for precomputed samples
+# filename -> stable document_id
+PRECOMPUTED_SAMPLE_MAP: dict[str, str] = {}
+# document_id -> enhanced ontology JSON
+IN_MEMORY_ONTOLOGY: dict[str, dict] = {}
 
 def _discover_sample_documents() -> list[dict]:
     docs = []
@@ -134,10 +144,12 @@ def _process_pdf_file(
     pdf_path: str,
     original_filename: str,
     page_range: str,
-    document_type: str
+    document_type: str,
+    *,
+    document_id_override: Optional[str] = None
 ) -> dict:
     """Shared PDF processing routine."""
-    document_id = f"{Path(original_filename).stem}_{int(datetime.utcnow().timestamp())}"
+    document_id = document_id_override or f"{Path(original_filename).stem}_{int(datetime.utcnow().timestamp())}"
     doc_paths = _get_document_paths(document_id)
     doc_paths["dir"].mkdir(parents=True, exist_ok=True)
 
@@ -164,6 +176,58 @@ def _process_pdf_file(
         "document": document,
         "enhanced": enhanced_doc
     }
+
+
+def _slugify_filename(filename: str) -> str:
+    base = Path(filename).stem.lower()
+    safe = "".join(ch if ch.isalnum() or ch in ("-", "_") else "-" for ch in base)
+    while "--" in safe:
+        safe = safe.replace("--", "-")
+    return safe.strip("-_") or "sample"
+
+
+def precompute_sample_documents() -> None:
+    """
+    Precompute enhanced ontology for bundled sample PDFs (once), store on disk,
+    and load the enhanced JSON into memory cache for fast retrieval.
+    """
+    if not SAMPLE_DOCS_DIR.exists():
+        logger.warning(f"Sample docs directory missing: {SAMPLE_DOCS_DIR}")
+        return
+
+    logger.info("Precomputing sample documents (if needed)...")
+    for entry in SAMPLE_DOCS_DIR.glob("*.pdf"):
+        try:
+            slug = _slugify_filename(entry.name)
+            stable_doc_id = f"sample_{slug}"
+            paths = _get_document_paths(stable_doc_id)
+
+            if paths["enhanced"].exists():
+                # Already computed on disk; load into memory
+                with open(paths["enhanced"], "r") as f:
+                    IN_MEMORY_ONTOLOGY[stable_doc_id] = json.load(f)
+                PRECOMPUTED_SAMPLE_MAP[entry.name] = stable_doc_id
+                logger.info(f"Loaded precomputed: {entry.name} -> {stable_doc_id}")
+                continue
+
+            # Not computed yet; run pipeline once
+            logger.info(f"Precomputing: {entry} -> {stable_doc_id}")
+            result = _process_pdf_file(
+                pdf_path=str(entry),
+                original_filename=entry.name,
+                page_range="all",
+                document_type="Clinical EHR",
+                document_id_override=stable_doc_id
+            )
+            IN_MEMORY_ONTOLOGY[stable_doc_id] = result["enhanced"]
+            PRECOMPUTED_SAMPLE_MAP[entry.name] = stable_doc_id
+            logger.info(f"Precomputed and cached: {entry.name} -> {stable_doc_id}")
+        except Exception as e:
+            logger.error(f"Failed to precompute {entry.name}: {e}", exc_info=True)
+
+# Run precompute at startup if enabled
+if PRECOMPUTE_SAMPLES:
+    precompute_sample_documents()
 
 
 @app.get("/")
@@ -264,8 +328,17 @@ async def upload_document(
 
 @app.get("/sample-documents")
 async def list_sample_documents():
-    """Return available bundled sample PDFs."""
-    return {"samples": SAMPLE_DOCS_CACHE}
+    """Return available bundled sample PDFs, with precomputed IDs when available."""
+    samples = []
+    for item in SAMPLE_DOCS_CACHE:
+        filename = item["filename"]
+        doc_id = PRECOMPUTED_SAMPLE_MAP.get(filename)
+        samples.append({
+            **item,
+            "precomputed": bool(doc_id),
+            "document_id": doc_id
+        })
+    return {"samples": samples}
 
 
 @app.get("/sample-documents/{filename}")
@@ -300,26 +373,54 @@ async def process_sample_document(
     page_range: str = "all",
     document_type: str = "Clinical EHR"
 ):
-    """Process a bundled sample PDF."""
+    """
+    Return precomputed result for a bundled sample PDF (after simulated delay),
+    falling back to on-demand processing if not precomputed.
+    """
     sample_path = _ensure_sample_document(filename)
-    logger.info(f"Processing sample document: {sample_path}")
+    logger.info(f"Requested sample processing: {sample_path}")
 
+    # Simulate ~10s processing time as requested
+    try:
+        await asyncio.sleep(10)
+    except Exception:
+        pass
+
+    stable_doc_id = PRECOMPUTED_SAMPLE_MAP.get(filename)
+    if stable_doc_id:
+        # Read total pages from memory cache if present, otherwise from disk
+        enhanced = IN_MEMORY_ONTOLOGY.get(stable_doc_id)
+        if enhanced is None:
+            paths = _get_document_paths(stable_doc_id)
+            if paths["enhanced"].exists():
+                with open(paths["enhanced"], "r") as f:
+                    enhanced = json.load(f)
+                    IN_MEMORY_ONTOLOGY[stable_doc_id] = enhanced
+        total_pages = (enhanced or {}).get("total_pages") or (enhanced or {}).get("processing_stats", {}).get("total_pages")
+        return {
+            "document_id": stable_doc_id,
+            "status": "complete",
+            "total_pages": total_pages,
+            "enhanced_json_url": f"/documents/{stable_doc_id}/ontology",
+            "source": "sample_document_precomputed",
+            "filename": filename
+        }
+
+    # Fallback: process on demand and cache
     result = _process_pdf_file(
         pdf_path=str(sample_path),
         original_filename=filename,
         page_range=page_range,
         document_type=document_type
     )
-
     document = result["document"]
     total_pages = document.get("total_pages") or document.get("processing_stats", {}).get("total_pages")
-
     return {
         "document_id": result["document_id"],
         "status": "complete",
         "total_pages": total_pages,
         "enhanced_json_url": f"/documents/{result['document_id']}/ontology",
-        "source": "sample_document",
+        "source": "sample_document_processed_now",
         "filename": filename
     }
 
@@ -329,11 +430,20 @@ async def get_ontology(document_id: str):
     """Return enhanced ontology JSON for a document."""
     paths = _get_document_paths(document_id)
     if not paths["enhanced"].exists():
+        # If not on disk, try in-memory (should not happen for precomputed, but safe)
+        cached = IN_MEMORY_ONTOLOGY.get(document_id)
+        if cached is not None:
+            return cached
         raise HTTPException(status_code=404, detail=f"Document {document_id} not found")
     
     try:
+        # Prefer in-memory cache if available
+        if document_id in IN_MEMORY_ONTOLOGY:
+            return IN_MEMORY_ONTOLOGY[document_id]
         with open(paths["enhanced"], "r") as f:
             enhanced = json.load(f)
+        # Populate cache for subsequent requests
+        IN_MEMORY_ONTOLOGY[document_id] = enhanced
         return enhanced
     except Exception as e:
         logger.error(f"Failed to load ontology for {document_id}: {e}", exc_info=True)
