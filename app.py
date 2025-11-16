@@ -267,6 +267,32 @@ async def list_sample_documents():
     return {"samples": SAMPLE_DOCS_CACHE}
 
 
+@app.get("/sample-documents/{filename}")
+async def get_sample_document(filename: str):
+    """
+    Serve a bundled sample PDF file for preview/download.
+    
+    Args:
+        filename: Name of the sample PDF file
+    
+    Returns:
+        PDF file response
+    """
+    sample_path = _ensure_sample_document(filename)
+    
+    if not sample_path.exists():
+        raise HTTPException(status_code=404, detail=f"Sample document {filename} not found")
+    
+    return FileResponse(
+        sample_path,
+        media_type="application/pdf",
+        filename=filename,
+        headers={
+            "Content-Disposition": f'inline; filename="{filename}"'
+        }
+    )
+
+
 @app.post("/sample-documents/{filename}/process")
 async def process_sample_document(
     filename: str,
