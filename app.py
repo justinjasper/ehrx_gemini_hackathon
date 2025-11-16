@@ -235,11 +235,13 @@ def precompute_sample_documents() -> None:
 def load_precomputed_cache_from_repo() -> None:
     """
     Load precomputed samples from PRECOMPUTED_DIR into memory and filename mapping.
-    This allows shipping precomputed JSONs with the repo/image.
-    Directory layout per sample:
-      precomputed_samples/<doc_id>/
-        - <doc_id>_enhanced.json
-        - metadata.json { original_filename, stable_document_id }
+    Supports current canonical single-file layout and legacy files:
+      Canonical (preferred):
+        precomputed_samples/<doc_id>/<doc_id>.json
+        precomputed_samples/<doc_id>/metadata.json
+      Legacy fallbacks:
+        precomputed_samples/<doc_id>/<doc_id>_enhanced.json
+        precomputed_samples/<doc_id>/<doc_id>_index.json
     """
     if not PRECOMPUTED_DIR.exists():
         return
@@ -247,12 +249,24 @@ def load_precomputed_cache_from_repo() -> None:
         if not doc_dir.is_dir():
             continue
         doc_id = doc_dir.name
+        # Preferred single-file artifact
+        canonical = doc_dir / f"{doc_id}.json"
+        # Legacy alternatives
         enhanced = doc_dir / f"{doc_id}_enhanced.json"
+        index_fallback = doc_dir / f"{doc_id}_index.json"
         metadata = doc_dir / "metadata.json"
-        if not enhanced.exists() or not metadata.exists():
+        # Determine which JSON to load
+        chosen_json = None
+        if canonical.exists():
+            chosen_json = canonical
+        elif enhanced.exists():
+            chosen_json = enhanced
+        elif index_fallback.exists():
+            chosen_json = index_fallback
+        if chosen_json is None or not metadata.exists():
             continue
         try:
-            with open(enhanced, "r") as f:
+            with open(chosen_json, "r") as f:
                 enhanced_json = json.load(f)
             with open(metadata, "r") as f:
                 meta = json.load(f)
@@ -447,10 +461,19 @@ async def process_sample_document(
         # Read total pages from memory cache if present, otherwise from disk
         enhanced = IN_MEMORY_ONTOLOGY.get(stable_doc_id)
         if enhanced is None:
-            # try from precomputed dir first
-            pre_dir = PRECOMPUTED_DIR / stable_doc_id / f"{stable_doc_id}_enhanced.json"
-            if pre_dir.exists():
-                with open(pre_dir, "r") as f:
+            # Try from precomputed dir first (canonical, then legacy)
+            pre_dir_canonical = PRECOMPUTED_DIR / stable_doc_id / f"{stable_doc_id}.json"
+            pre_dir_enhanced = PRECOMPUTED_DIR / stable_doc_id / f"{stable_doc_id}_enhanced.json"
+            pre_dir_index = PRECOMPUTED_DIR / stable_doc_id / f"{stable_doc_id}_index.json"
+            chosen = None
+            if pre_dir_canonical.exists():
+                chosen = pre_dir_canonical
+            elif pre_dir_enhanced.exists():
+                chosen = pre_dir_enhanced
+            elif pre_dir_index.exists():
+                chosen = pre_dir_index
+            if chosen and chosen.exists():
+                with open(chosen, "r") as f:
                     enhanced = json.load(f)
                     IN_MEMORY_ONTOLOGY[stable_doc_id] = enhanced
             else:
@@ -492,17 +515,40 @@ async def process_sample_document(
 async def get_ontology(document_id: str):
     """Return enhanced ontology JSON for a document."""
     paths = _get_document_paths(document_id)
+    # Prefer in-memory cache immediately
+    cached = IN_MEMORY_ONTOLOGY.get(document_id)
+    if cached is not None:
+        return cached
+    # Look in precomputed dir (canonical first, then legacy)
+    pre_dir_canonical = PRECOMPUTED_DIR / document_id / f"{document_id}.json"
+    pre_dir_enhanced = PRECOMPUTED_DIR / document_id / f"{document_id}_enhanced.json"
+    pre_dir_index = PRECOMPUTED_DIR / document_id / f"{document_id}_index.json"
+    chosen = None
+    if pre_dir_canonical.exists():
+        chosen = pre_dir_canonical
+    elif pre_dir_enhanced.exists():
+        chosen = pre_dir_enhanced
+    elif pre_dir_index.exists():
+        chosen = pre_dir_index
+    if chosen and chosen.exists():
+        try:
+            with open(chosen, "r") as f:
+                enhanced = json.load(f)
+            IN_MEMORY_ONTOLOGY[document_id] = enhanced
+            # Mirror into OUTPUT_DIR for listing parity
+            out_paths = _get_document_paths(document_id)
+            out_paths["dir"].mkdir(parents=True, exist_ok=True)
+            with open(out_paths["enhanced"], "w") as f:
+                json.dump(enhanced, f, indent=2)
+            return enhanced
+        except Exception as e:
+            logger.error(f"Failed to load precomputed ontology for {document_id}: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail="Failed to load ontology")
+    # Otherwise try runtime output dir (legacy enhanced path)
     if not paths["enhanced"].exists():
-        # If not on disk, try in-memory (should not happen for precomputed, but safe)
-        cached = IN_MEMORY_ONTOLOGY.get(document_id)
-        if cached is not None:
-            return cached
         raise HTTPException(status_code=404, detail=f"Document {document_id} not found")
     
     try:
-        # Prefer in-memory cache if available
-        if document_id in IN_MEMORY_ONTOLOGY:
-            return IN_MEMORY_ONTOLOGY[document_id]
         with open(paths["enhanced"], "r") as f:
             enhanced = json.load(f)
         # Populate cache for subsequent requests
