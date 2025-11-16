@@ -72,6 +72,10 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 SAMPLE_DOCS_DIR = Path(os.getenv("SAMPLE_DOCS_DIR", "./SampleEHR_docs")).resolve()
 SAMPLE_DOCS_DIR.mkdir(parents=True, exist_ok=True)
 
+# Precomputed cache directory (checked into repo and copied into image)
+PRECOMPUTED_DIR = Path(os.getenv("PRECOMPUTED_DIR", "./precomputed_samples")).resolve()
+PRECOMPUTED_DIR.mkdir(parents=True, exist_ok=True)
+
 # Precompute controls
 PRECOMPUTE_SAMPLES = os.getenv("PRECOMPUTE_SAMPLES", "false").lower() in {"1", "true", "yes", "y"}
 
@@ -80,6 +84,8 @@ PRECOMPUTE_SAMPLES = os.getenv("PRECOMPUTE_SAMPLES", "false").lower() in {"1", "
 PRECOMPUTED_SAMPLE_MAP: dict[str, str] = {}
 # document_id -> enhanced ontology JSON
 IN_MEMORY_ONTOLOGY: dict[str, dict] = {}
+# Set of known precomputed document_ids
+PRECOMPUTED_DOC_IDS: set[str] = set()
 
 def _discover_sample_documents() -> list[dict]:
     docs = []
@@ -225,12 +231,51 @@ def precompute_sample_documents() -> None:
         except Exception as e:
             logger.error(f"Failed to precompute {entry.name}: {e}", exc_info=True)
 
+def load_precomputed_cache_from_repo() -> None:
+    """
+    Load precomputed samples from PRECOMPUTED_DIR into memory and filename mapping.
+    This allows shipping precomputed JSONs with the repo/image.
+    Directory layout per sample:
+      precomputed_samples/<doc_id>/
+        - <doc_id>_enhanced.json
+        - metadata.json { original_filename, stable_document_id }
+    """
+    if not PRECOMPUTED_DIR.exists():
+        return
+    for doc_dir in PRECOMPUTED_DIR.iterdir():
+        if not doc_dir.is_dir():
+            continue
+        doc_id = doc_dir.name
+        enhanced = doc_dir / f"{doc_id}_enhanced.json"
+        metadata = doc_dir / "metadata.json"
+        if not enhanced.exists() or not metadata.exists():
+            continue
+        try:
+            with open(enhanced, "r") as f:
+                enhanced_json = json.load(f)
+            with open(metadata, "r") as f:
+                meta = json.load(f)
+            IN_MEMORY_ONTOLOGY[doc_id] = enhanced_json
+            PRECOMPUTED_DOC_IDS.add(doc_id)
+            orig = meta.get("original_filename")
+            if orig:
+                PRECOMPUTED_SAMPLE_MAP[orig] = doc_id
+            # Also copy to OUTPUT_DIR to make /documents listing work uniformly
+            out_paths = _get_document_paths(doc_id)
+            out_paths["dir"].mkdir(parents=True, exist_ok=True)
+            with open(out_paths["enhanced"], "w") as f:
+                json.dump(enhanced_json, f, indent=2)
+        except Exception as e:
+            logger.warning(f"Failed loading precomputed {doc_dir}: {e}")
+
 async def precompute_samples_background() -> None:
     """Run precompute in a background thread to avoid blocking startup."""
     await asyncio.to_thread(precompute_sample_documents)
 
 @app.on_event("startup")
 async def on_startup():
+    # Always load pre-shipped precomputed cache if present
+    load_precomputed_cache_from_repo()
     # Schedule precompute in the background if enabled (non-blocking)
     if PRECOMPUTE_SAMPLES:
         try:
@@ -401,11 +446,18 @@ async def process_sample_document(
         # Read total pages from memory cache if present, otherwise from disk
         enhanced = IN_MEMORY_ONTOLOGY.get(stable_doc_id)
         if enhanced is None:
-            paths = _get_document_paths(stable_doc_id)
-            if paths["enhanced"].exists():
-                with open(paths["enhanced"], "r") as f:
+            # try from precomputed dir first
+            pre_dir = PRECOMPUTED_DIR / stable_doc_id / f"{stable_doc_id}_enhanced.json"
+            if pre_dir.exists():
+                with open(pre_dir, "r") as f:
                     enhanced = json.load(f)
                     IN_MEMORY_ONTOLOGY[stable_doc_id] = enhanced
+            else:
+                paths = _get_document_paths(stable_doc_id)
+                if paths["enhanced"].exists():
+                    with open(paths["enhanced"], "r") as f:
+                        enhanced = json.load(f)
+                        IN_MEMORY_ONTOLOGY[stable_doc_id] = enhanced
         total_pages = (enhanced or {}).get("total_pages") or (enhanced or {}).get("processing_stats", {}).get("total_pages")
         return {
             "document_id": stable_doc_id,

@@ -81,6 +81,9 @@ COPY --chown=ehrx:ehrx configs/ ./configs/
 # Note: Ensure SampleEHR_docs/ exists in the build context (not excluded by .dockerignore)
 COPY --chown=ehrx:ehrx SampleEHR_docs/ ./SampleEHR_docs/
 
+# Copy precomputed samples (if present) into image
+COPY --chown=ehrx:ehrx precomputed_samples/ ./precomputed_samples/
+
 COPY --chown=ehrx:ehrx app.py run_mvp_pipeline.py test.py test_query_only.py ./
 COPY --chown=ehrx:ehrx setup.py ./
 

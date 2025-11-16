@@ -56,6 +56,8 @@ temp/
 # Explicitly include SampleEHR_docs (exclusions below won't apply)
 !SampleEHR_docs/
 !SampleEHR_docs/**/*.pdf
+!precomputed_samples/
+!precomputed_samples/**/*
 
 # Sensitive files
 .env
