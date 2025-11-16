@@ -52,7 +52,7 @@ assets/
 *.jpeg
 *.csv
 *.jsonl
-*.json
+#*.json
 !configs/*.yaml
 !configs/*.json
 
