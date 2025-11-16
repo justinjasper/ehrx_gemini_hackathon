@@ -1,0 +1,199 @@
+version: '3.8'
+
+services:
+  # Backend API service (FastAPI web server)
+  ehrx-backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ehrx-backend:latest
+    container_name: ehrx-backend
+    
+    # Expose web server port
+    ports:
+      - "${PORT:-8080}:8080"
+    
+    # Environment variables
+    environment:
+      # Port configuration (FastAPI server listens on this)
+      - PORT=${PORT:-8080}
+      
+      # GCP Configuration (replace with your values or use .env file)
+      - GCP_PROJECT_ID=${GCP_PROJECT_ID}
+      - GOOGLE_CLOUD_PROJECT=${GOOGLE_CLOUD_PROJECT}
+      - GOOGLE_APPLICATION_CREDENTIALS=${GOOGLE_APPLICATION_CREDENTIALS:-/credentials/gcp-key.json}
+      - GCP_LOCATION=${GCP_LOCATION:-us-central1}
+      
+      # VLM Configuration (optional overrides)
+      - VLM_MODEL_NAME=${VLM_MODEL_NAME:-gemini-2.5-flash}
+      - VLM_MAX_TOKENS=${VLM_MAX_TOKENS:-8192}
+      - VLM_TEMPERATURE=${VLM_TEMPERATURE:-0.1}
+      
+      # Sample documents directory (bundled in image, override if needed)
+      - SAMPLE_DOCS_DIR=${SAMPLE_DOCS_DIR:-./SampleEHR_docs}
+      
+      # CORS configuration (comma-separated list of allowed origins)
+      - CORS_ALLOW_ORIGINS=${CORS_ALLOW_ORIGINS:-http://localhost:5173,http://localhost:4173}
+      
+      # Python configuration
+      - PYTHONUNBUFFERED=1
+      - PYTHONDONTWRITEBYTECODE=1
+    
+    # Volume mounts
+    volumes:
+      # Mount output directory for persistence (app.py uses /tmp/ehrx_output by default)
+      # Mount to local directory to persist results between container restarts
+      - ./output:/tmp/ehrx_output:rw
+      
+      # Mount GCP credentials (read-only) - optional, only if using service account file
+      # Uncomment and set GOOGLE_APPLICATION_CREDENTIALS_HOST in .env if needed:
+      # - ${GOOGLE_APPLICATION_CREDENTIALS_HOST}:/credentials/gcp-key.json:ro
+      
+      # Note: SampleEHR_docs is bundled in the image (copied at build time)
+      # Configs are also bundled in the image
+    
+    # Working directory (matches Dockerfile)
+    working_dir: /app
+    
+    # Command to run FastAPI web server (matches Dockerfile CMD)
+    command: python app.py
+    
+    # Resource limits (adjust based on your needs)
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 8G
+        reservations:
+          cpus: '2'
+          memory: 4G
+    
+    # Health check (matches Dockerfile HEALTHCHECK)
+    healthcheck:
+      test: ["CMD", "python", "-c", "import ehrx; import cv2; import pytesseract; print('OK')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+    
+    # Restart policy
+    restart: unless-stopped
+
+  # Frontend service (optional - for full stack local development)
+  ehrx-frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # Override backend URL for local development
+        - VITE_API_BASE_URL=${FRONTEND_API_BASE_URL:-http://localhost:8080}
+    image: ehrx-frontend:latest
+    container_name: ehrx-frontend
+    
+    # Expose frontend port
+    ports:
+      - "${FRONTEND_PORT:-5173}:8080"
+    
+    # Depends on backend
+    depends_on:
+      - ehrx-backend
+    
+    # Restart policy
+    restart: unless-stopped
+
+  # Interactive shell service (for debugging)
+  ehrx-shell:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ehrx-backend:latest
+    container_name: ehrx-shell
+    command: /bin/bash
+    stdin_open: true
+    tty: true
+    volumes:
+      - ./output:/tmp/ehrx_output:rw
+      # - ${GOOGLE_APPLICATION_CREDENTIALS_HOST}:/credentials/gcp-key.json:ro
+    working_dir: /app
+    environment:
+      - GCP_PROJECT_ID=${GCP_PROJECT_ID}
+      - GOOGLE_CLOUD_PROJECT=${GOOGLE_CLOUD_PROJECT}
+      - GCP_LOCATION=${GCP_LOCATION:-us-central1}
+      - VLM_MODEL_NAME=${VLM_MODEL_NAME:-gemini-2.5-flash}
+      - VLM_MAX_TOKENS=${VLM_MAX_TOKENS:-8192}
+      - VLM_TEMPERATURE=${VLM_TEMPERATURE:-0.1}
+      - PYTHONUNBUFFERED=1
+
+# Networks (for multi-container setup)
+networks:
+  default:
+    name: ehrx-network
+    driver: bridge
+
+# ========================================================================
+# Usage Examples:
+# ========================================================================
+#
+# 1. Build all services:
+#    docker-compose build
+#
+# 2. Start backend API server:
+#    docker-compose up ehrx-backend
+#    # Backend will be available at http://localhost:8080
+#
+# 3. Start full stack (backend + frontend):
+#    docker-compose up
+#    # Backend: http://localhost:8080
+#    # Frontend: http://localhost:5173
+#
+# 4. Run in background:
+#    docker-compose up -d
+#
+# 5. View logs:
+#    docker-compose logs -f ehrx-backend
+#    docker-compose logs -f ehrx-frontend
+#
+# 6. Stop services:
+#    docker-compose down
+#
+# 7. Run CLI pipeline script (override command):
+#    docker-compose run --rm ehrx-backend python run_mvp_pipeline.py
+#
+# 8. Run test scripts:
+#    docker-compose run --rm ehrx-backend python test.py
+#    docker-compose run --rm ehrx-backend python test_query_only.py
+#    docker-compose run --rm ehrx-backend pytest tests/
+#
+# 9. Interactive shell (for debugging):
+#    docker-compose run --rm ehrx-shell
+#    # Or: docker-compose run --rm ehrx-backend /bin/bash
+#
+# 10. Using environment file (.env):
+#     Create a .env file in the project root with:
+#       GCP_PROJECT_ID=your-project-id
+#       GOOGLE_CLOUD_PROJECT=your-project-id
+#       GCP_LOCATION=us-central1
+#       PORT=8080
+#       FRONTEND_PORT=5173
+#       FRONTEND_API_BASE_URL=http://localhost:8080
+#       CORS_ALLOW_ORIGINS=http://localhost:5173,http://localhost:4173
+#       # Optional: GOOGLE_APPLICATION_CREDENTIALS_HOST=/path/to/credentials.json
+#     Then run: docker-compose up
+#
+# 11. Access API documentation:
+#     Once backend is running: http://localhost:8080/docs
+#
+# 12. Health check:
+#     curl http://localhost:8080/health
+#
+# ========================================================================
+# Notes:
+# ========================================================================
+# - Sample PDFs are bundled in the backend image (SampleEHR_docs/)
+# - Processing output is persisted in ./output directory (mapped to /tmp/ehrx_output in container)
+# - Backend listens on port 8080 (configurable via PORT env var)
+# - Frontend (if enabled) listens on port 5173 by default (configurable via FRONTEND_PORT)
+# - For Cloud Run deployment, use the Dockerfile directly (not docker-compose)
+#
+# ========================================================================
+
