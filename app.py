@@ -13,10 +13,11 @@ import logging
 import tempfile
 import re
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Any
 from datetime import datetime
+from threading import Lock
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
+from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, status
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -91,6 +92,34 @@ PRECOMPUTED_SAMPLE_MAP: dict[str, str] = {}
 IN_MEMORY_ONTOLOGY: dict[str, dict] = {}
 # Set of known precomputed document_ids
 PRECOMPUTED_DOC_IDS: set[str] = set()
+
+# Processing job tracking
+PROCESSING_JOBS: Dict[str, Dict[str, Any]] = {}
+PROCESSING_LOCK = Lock()
+
+
+def _update_processing_job(document_id: str, **updates: Any) -> Dict[str, Any]:
+    """Create or update a processing job entry."""
+    with PROCESSING_LOCK:
+        job = PROCESSING_JOBS.get(document_id)
+        if job is None:
+            job = {
+                "document_id": document_id,
+                "status": "processing",
+                "started_at": datetime.utcnow().isoformat(),
+                "updated_at": datetime.utcnow().isoformat(),
+                "message": "Queued for processing"
+            }
+            PROCESSING_JOBS[document_id] = job
+        job.update(updates)
+        job["updated_at"] = datetime.utcnow().isoformat()
+        return job
+
+
+def _get_processing_job(document_id: str) -> Optional[Dict[str, Any]]:
+    """Return processing job metadata if present."""
+    with PROCESSING_LOCK:
+        return PROCESSING_JOBS.get(document_id)
 
 def _discover_sample_documents() -> list[dict]:
     docs = []
@@ -193,6 +222,57 @@ def _process_pdf_file(
         "document": document,
         "enhanced": enhanced_doc
     }
+
+
+def _process_document_background(
+    document_id: str,
+    tmp_pdf_path: str,
+    original_filename: str,
+    page_range: str,
+    document_type: str
+) -> None:
+    """Background task wrapper that updates processing job metadata."""
+    _update_processing_job(
+        document_id,
+        status="processing",
+        message="Processing started"
+    )
+    try:
+        result = _process_pdf_file(
+            pdf_path=tmp_pdf_path,
+            original_filename=original_filename,
+            page_range=page_range,
+            document_type=document_type,
+            document_id_override=document_id
+        )
+        document = result["document"]
+        total_pages = (
+            document.get("total_pages")
+            or document.get("processing_stats", {}).get("total_pages")
+            or 0
+        )
+        _update_processing_job(
+            document_id,
+            status="complete",
+            message="Processing finished",
+            total_pages=total_pages,
+            enhanced_json_url=f"/documents/{document_id}/ontology",
+            completed_at=datetime.utcnow().isoformat()
+        )
+    except Exception as exc:
+        logger.error(f"Background processing failed for {document_id}: {exc}", exc_info=True)
+        _update_processing_job(
+            document_id,
+            status="failed",
+            message="Processing failed",
+            error=str(exc),
+            completed_at=datetime.utcnow().isoformat()
+        )
+    finally:
+        try:
+            os.unlink(tmp_pdf_path)
+        except FileNotFoundError:
+            pass
 
 
 def _slugify_filename(filename: str) -> str:
@@ -367,6 +447,7 @@ async def root():
             "sample_preview": "/sample-documents/{filename} (GET)",
             "process_sample": "/sample-documents/{filename}/process (POST)",
             "ontology": "/documents/{id}/ontology (GET)",
+            "document_status": "/documents/{document_id}/status (GET)",
             "query": "/documents/{id}/query (POST)",
             "precomputed_answers_list": "/precomputed-answers (GET)",
             "precomputed_answers_get": "/precomputed-answers/{document_id} (GET)",
@@ -395,7 +476,7 @@ async def health_check():
         raise HTTPException(status_code=503, detail=f"Service unhealthy: {str(e)}")
 
 
-@app.post("/upload")
+@app.post("/upload", status_code=status.HTTP_202_ACCEPTED)
 async def upload_document(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
@@ -420,6 +501,9 @@ async def upload_document(
         raise HTTPException(status_code=400, detail="File must be a PDF")
     
     try:
+        raw_stem = Path(file.filename).stem
+        document_id = _clean_document_id(raw_stem)
+
         # Save uploaded file to temp location
         with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
             content = await file.read()
@@ -427,29 +511,67 @@ async def upload_document(
             tmp_pdf_path = tmp_file.name
         
         logger.info(f"Saved PDF to: {tmp_pdf_path}")
-        
-        result = _process_pdf_file(
-            pdf_path=tmp_pdf_path,
-            original_filename=file.filename,
-            page_range=page_range,
-            document_type=document_type
+        _update_processing_job(
+            document_id,
+            status="processing",
+            message="Queued for processing",
+            total_pages=None,
+            processed_pages=0
         )
-        os.unlink(tmp_pdf_path)
+        background_tasks.add_task(
+            _process_document_background,
+            document_id,
+            tmp_pdf_path,
+            file.filename,
+            page_range,
+            document_type
+        )
 
-        document = result["document"]
-        total_pages = document.get("total_pages") or document["processing_stats"].get("total_pages")
-        status = "complete"
-        
-        return {
-            "document_id": result["document_id"],
-            "status": status,
-            "total_pages": total_pages,
-            "enhanced_json_url": f"/documents/{result['document_id']}/ontology"
-        }
+        return JSONResponse(
+            status_code=status.HTTP_202_ACCEPTED,
+            content={
+                "document_id": document_id,
+                "status": "processing",
+                "detail": "Document accepted. Poll the status endpoint for progress.",
+                "status_url": f"/documents/{document_id}/status",
+                "enhanced_json_url": f"/documents/{document_id}/ontology"
+            }
+        )
         
     except Exception as e:
         logger.error(f"Processing failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
+
+
+@app.get("/documents/{document_id}/status")
+async def get_document_status(document_id: str):
+    """
+    Return processing status for a document.
+    """
+    job = _get_processing_job(document_id)
+    if job:
+        return job
+
+    # If no job metadata, infer completion if enhanced file exists
+    paths = _get_document_paths(document_id)
+    if paths["enhanced"].exists():
+        total_pages = None
+        try:
+            with open(paths["enhanced"], "r") as f:
+                enhanced = json.load(f)
+            total_pages = enhanced.get("total_pages")
+        except Exception:
+            total_pages = None
+        return {
+            "document_id": document_id,
+            "status": "complete",
+            "message": "Document already processed",
+            "total_pages": total_pages,
+            "enhanced_json_url": f"/documents/{document_id}/ontology",
+            "updated_at": datetime.utcnow().isoformat()
+        }
+
+    raise HTTPException(status_code=404, detail=f"Document {document_id} not found")
 
 
 @app.get("/sample-documents")
