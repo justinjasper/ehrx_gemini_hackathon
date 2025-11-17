@@ -8,6 +8,7 @@ Two-stage process:
 
 import json
 import logging
+import time
 from typing import Dict, Any, List, Optional
 from pathlib import Path
 
@@ -227,19 +228,42 @@ Only return the JSON object, nothing else."""
             }
         )
 
-        response = self.flash_model.generate_content(
-            prompt,
-            generation_config=generation_config
-        )
+        # Retry logic for JSON parsing errors (up to 7 attempts)
+        max_retries = 7
+        last_error = None
+        
+        for attempt in range(1, max_retries + 1):
+            try:
+                response = self.flash_model.generate_content(
+                    prompt,
+                    generation_config=generation_config
+                )
 
-        # Parse JSON response (guaranteed valid due to response_schema)
-        result = json.loads(response.text)
+                # Parse JSON response (guaranteed valid due to response_schema, but sometimes fails)
+                result = json.loads(response.text)
 
-        # Debug logging
-        self.logger.info(f"Flash identified {len(result.get('relevant_types', []))} relevant types")
-        self.logger.debug(f"Relevant types: {result.get('relevant_types', [])}")
+                # Debug logging
+                self.logger.info(f"Flash identified {len(result.get('relevant_types', []))} relevant types")
+                self.logger.debug(f"Relevant types: {result.get('relevant_types', [])}")
 
-        return result
+                return result
+                
+            except (json.JSONDecodeError, ValueError) as e:
+                last_error = e
+                if attempt < max_retries:
+                    wait_time = min(2 ** attempt, 10)  # Exponential backoff, max 10 seconds
+                    self.logger.warning(
+                        f"JSON parsing error in Flash response (attempt {attempt}/{max_retries}): {e}. "
+                        f"Retrying in {wait_time}s..."
+                    )
+                    time.sleep(wait_time)
+                else:
+                    self.logger.error(
+                        f"JSON parsing failed after {max_retries} attempts: {e}"
+                    )
+                    raise ValueError(
+                        f"Failed to parse Flash model JSON response after {max_retries} retries: {e}"
+                    ) from e
 
     def _filter_schema(self, relevant_fields: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -433,14 +457,37 @@ Only return the JSON object, nothing else."""
             }
         )
 
-        response = self.pro_model.generate_content(
-            prompt,
-            generation_config=generation_config
-        )
+        # Retry logic for JSON parsing errors (up to 7 attempts)
+        max_retries = 7
+        last_error = None
+        
+        for attempt in range(1, max_retries + 1):
+            try:
+                response = self.pro_model.generate_content(
+                    prompt,
+                    generation_config=generation_config
+                )
 
-        # Parse JSON response (guaranteed valid due to response_schema)
-        result = json.loads(response.text)
-        return result
+                # Parse JSON response (guaranteed valid due to response_schema, but sometimes fails)
+                result = json.loads(response.text)
+                return result
+                
+            except (json.JSONDecodeError, ValueError) as e:
+                last_error = e
+                if attempt < max_retries:
+                    wait_time = min(2 ** attempt, 10)  # Exponential backoff, max 10 seconds
+                    self.logger.warning(
+                        f"JSON parsing error in Pro response (attempt {attempt}/{max_retries}): {e}. "
+                        f"Retrying in {wait_time}s..."
+                    )
+                    time.sleep(wait_time)
+                else:
+                    self.logger.error(
+                        f"JSON parsing failed after {max_retries} attempts: {e}"
+                    )
+                    raise ValueError(
+                        f"Failed to parse Pro model JSON response after {max_retries} retries: {e}"
+                    ) from e
 
     def _count_total_elements(self) -> int:
         """Count total elements in schema."""
